@@ -65,11 +65,13 @@ CONTENT SOURCE (one required):
 OPTIONS:
   --title "..."               Label shown at top of pane
   --page                      Pipe through less -R with mouse scrolling
+  --no-page                   Disable paging (--run-in-blocks enables by default)
   --log                       Capture output via script(1)
   --interactive               Skip script(1) wrapping (for interactive commands)
   --full                      Pane spans full window width/height
   --no-full                   Pane splits current pane only (default)
 
+  Note: --run-in-blocks enables --page by default so output starts at top
   Note: Set CREATE_FULL_PANES=true in ~/.claude-pane.conf to default to --full
 
 EXAMPLES:
@@ -257,6 +259,7 @@ cmd_run() {
     local follow_file=""
     local blocks_script=""
     local use_page=false
+    local page_explicit=false  # track if --page or --no-page was explicitly set
     local use_log=false
     local use_interactive=false
     local use_full="$CREATE_FULL_PANES"  # default from config or false
@@ -289,6 +292,12 @@ cmd_run() {
                 ;;
             --page)
                 use_page=true
+                page_explicit=true
+                shift
+                ;;
+            --no-page)
+                use_page=false
+                page_explicit=true
                 shift
                 ;;
             --log)
@@ -332,6 +341,11 @@ cmd_run() {
     [[ -n "$blocks_script" ]] && ((++source_count))
 
     [[ $source_count -eq 1 ]] || die "exactly one content source required (--command, --follow, or --run-in-blocks)"
+
+    # Default to paging for --run-in-blocks (unless explicitly disabled)
+    if [[ -n "$blocks_script" && "$page_explicit" == "false" ]]; then
+        use_page=true
+    fi
 
     # Handle --command - (read from stdin)
     if [[ "$command" == "-" ]]; then
