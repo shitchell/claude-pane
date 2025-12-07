@@ -213,22 +213,25 @@ wrap_command() {
 
     local wrapped=""
 
-    # Header: title and/or instructions
+    # Build header content
+    local header=""
     if [[ -n "$title" ]]; then
-        wrapped+="printf '%s\\n' \$'\\e[36m=== $title ===\\e[0m'; "
+        header+="printf '%s\\n' \$'\\e[36m=== $title ===\\e[0m'; "
     fi
     if [[ -n "$header_instructions" ]]; then
-        wrapped+="printf '%s\\n' \$'\\e[2m$header_instructions\\e[0m'; "
+        header+="printf '%s\\n' \$'\\e[2m$header_instructions\\e[0m'; "
     fi
     if [[ -n "$title" || -n "$header_instructions" ]]; then
-        wrapped+="echo; "
+        header+="echo; "
     fi
 
     # Main command (with optional paging)
     if [[ "$use_page" == "true" ]]; then
-        wrapped+="{ $cmd; } 2>&1 | less -R --mouse; EXIT_CODE=\${PIPESTATUS[0]}; "
+        # Include header in pipe, redirect cmd stdin from /dev/null to prevent
+        # processes (like node) from interfering with less's keyboard input
+        wrapped+="{ ${header}{ $cmd; } < /dev/null; } 2>&1 | less -R --mouse; EXIT_CODE=\${PIPESTATUS[0]}; "
     else
-        wrapped+="$cmd; EXIT_CODE=\$?; "
+        wrapped+="${header}$cmd; EXIT_CODE=\$?; "
     fi
 
     # Footer: exit code + q to close
