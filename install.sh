@@ -65,7 +65,7 @@ mkdir -pv "$BIN_DIR"
 
 # Install script
 cp -v "$SCRIPT_DIR/claude-pane.sh" "$BIN_DIR/claude-pane"
-chmod -v +x "$BIN_DIR/claude-pane"
+chmod -v 755 "$BIN_DIR/claude-pane"
 
 echo
 echo "Done!"
