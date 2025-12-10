@@ -46,8 +46,8 @@ claude-pane list                                  # show active panes
 - `--page` → Pipe through less (for scrollable static output)
 - `--full` → Pane spans full window width/height
 - `--no-full` → Pane splits current pane only (default)
-- `--log` → Log output via `script(1)` for debugging
 - `--follow <file>` → Shorthand for `tail -f <file>`
+- `--view <file>` → View file in less (uses `lessfilter` if available)
 - `--run-in-blocks <script>` → Run script block-by-block (requires [block-run](https://github.com/shitchell/block-run))
 
 ## Code Examples in Panes

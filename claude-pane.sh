@@ -1,588 +1,1322 @@
 #!/usr/bin/env bash
-set -euo pipefail
-
+#
 # claude-pane: tmux pane manager for Claude Code teaching sessions
 # Creates panes to show docs, code examples, SQL, or live processes
+#
+# Design principles:
+# * "One contiguous block": feature updates should only require changes in one place
+# * Sourceable: all functions use return, never exit (except help after parse-args)
+# * DRY: single source of truth for field definitions, etc.
 
-MARKER_DIR="/tmp/claude-pane.${USER:-$(id -un)}"
-LOG_DIR="$MARKER_DIR/logs"
-CONFIG_FILE="${HOME}/.claude-pane.conf"
 
-# Load config if exists (sets defaults like CREATE_FULL_PANES)
-[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+## exit codes ##################################################################
+################################################################################
 
-# Default values (config can override these)
+declare -ri E_SUCCESS=0
+declare -ri E_ERROR=1
+declare -ri E_INVALID_OPTION=2
+declare -ri E_INVALID_ACTION=3
+
+
+## global defaults #############################################################
+################################################################################
+
+# Directory paths (can be overridden by config)
+MARKER_DIR="${MARKER_DIR:-/tmp/claude-pane.${USER:-$(id -un)}}"
+LOG_DIR="${LOG_DIR:-${MARKER_DIR}/logs}"
+CONFIG_FILE="${CONFIG_FILE:-${HOME}/.claude-pane.conf}"
+
+# Configuration defaults
+LOG_SIZE_LIMIT="${LOG_SIZE_LIMIT:-5M}"
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-3}"
 CREATE_FULL_PANES="${CREATE_FULL_PANES:-false}"
 
-# Check for optional dependencies
-IS_INSTALLED_BLOCK_RUN=false
-command -v block-run &>/dev/null && IS_INSTALLED_BLOCK_RUN=true
+# Global marker array for read/write operations
+declare -A MARKER
 
-# Colors
-RED=$'\e[31m'
-GREEN=$'\e[32m'
-YELLOW=$'\e[33m'
-CYAN=$'\e[36m'
-DIM=$'\e[2m'
-RESET=$'\e[0m'
+# Global output from find-pane-at-position
+FOUND_PANE_ID=""
+FOUND_VIA=""
 
-#-----------------------------------------------------------------------------
-# Usage
-#-----------------------------------------------------------------------------
+# Command stage globals (set by __action-run-parse-args and build functions)
+COMMAND_RAW=""
+COMMAND_BUILT=""
+COMMAND_FINAL=""
 
-usage() {
-    cat <<'EOF'
-claude-pane: tmux pane manager for teaching sessions
 
-USAGE:
-  claude-pane <command> [args]
+## traps #######################################################################
+################################################################################
 
-COMMANDS:
-  run <position> [options]   Create or replace pane at position
-  kill <position>            Close pane at position
-  list                       Show active panes
-
-Run 'claude-pane <command> --help' for command-specific help.
-EOF
-    exit "${1:-0}"
+function silence-output() {
+    :  'Silence all script output'
+    exec 3>&1 4>&2 1>/dev/null 2>&1
 }
 
-usage_run() {
-    cat <<'EOF'
-claude-pane run: Create or replace pane at position
+function restore-output() {
+    :  'Restore script output after a call to silence-output'
+    [[ -t 3 ]] && exec 1>&3 3>&-
+    [[ -t 4 ]] && exec 2>&4 4>&-
+}
 
-USAGE:
-  claude-pane run <position> [options] <content-source>
+function trap-exit() {
+    :  'An exit trap to restore output on script end'
+    restore-output
+}
+trap trap-exit EXIT
+
+
+## colors ######################################################################
+################################################################################
+
+# Determine if we're in a terminal
+[[ -t 1 ]] && __IN_TERMINAL=true || __IN_TERMINAL=false
+
+function setup-colors() {
+    :  'Set up color variables'
+    C_RED=$'\e[31m'
+    C_GREEN=$'\e[32m'
+    C_YELLOW=$'\e[33m'
+    C_BLUE=$'\e[34m'
+    C_MAGENTA=$'\e[35m'
+    C_CYAN=$'\e[36m'
+    C_WHITE=$'\e[37m'
+    S_RESET=$'\e[0m'
+    S_BOLD=$'\e[1m'
+    S_DIM=$'\e[2m'
+    S_UNDERLINE=$'\e[4m'
+    S_BLINK=$'\e[5m'
+    S_INVERT=$'\e[7m'
+    S_HIDDEN=$'\e[8m'
+}
+
+function unset-colors() {
+    :  'Unset color variables'
+    C_RED='' C_GREEN='' C_YELLOW='' C_BLUE='' C_MAGENTA='' C_CYAN='' C_WHITE=''
+    S_RESET='' S_BOLD='' S_DIM='' S_UNDERLINE='' S_BLINK='' S_INVERT='' S_HIDDEN=''
+}
+
+
+## usage functions #############################################################
+################################################################################
+
+function help-usage() {
+    :  'Print brief usage'
+    echo "usage: $(basename "${0}") [-h] [--help] [-c <when>] <action> [<args>]"
+}
+
+function help-epilogue() {
+    :  'Print a brief description of the script'
+    echo "tmux pane manager for Claude Code teaching sessions"
+}
+
+function help-full() {
+    :  'Print full help'
+    help-usage
+    help-epilogue
+    echo
+    echo "Actions:"
+    cat << '    EOF'
+    run <position> [opts]     create or replace pane at position
+    kill <position>           close pane at position
+    list                      show active panes
+    capture <position>        capture pane contents to stdout
+    flush <position>          force-flush logs for pane
+    help [action]             display help for a specific action
+    EOF
+    echo
+    echo "Base Options:"
+    cat << '    EOF'
+    -h                        display usage
+    --help                    display this help message
+    --config-file <file>      use the specified configuration file
+    -c/--color <when>         when to use color ("auto", "always", "never")
+    EOF
+    echo
+    echo "For action-specific help, run:"
+    echo "    $(basename "${0}") <action> --help"
+}
+
+function parse-args() {
+    :  'Parse command-line arguments for the base command'
+    local -- __color_when="${COLOR:-auto}"
+    local -- __i
+
+    # Parse the arguments first for a config file
+    for (( __i=1; __i<=${#}; __i++ )); do
+        if [[ "${!__i}" == "--config-file" ]]; then
+            (( __i++ ))
+            CONFIG_FILE="${!__i}"
+        fi
+    done
+
+    # Default values
+    DO_COLOR=false
+    DO_SILENT=false
+    ACTION=""
+    ACTION_ARGS=()
+
+    # Loop over the arguments
+    while [[ ${#} -gt 0 ]]; do
+        case "${1}" in
+            -h)
+                help-usage
+                help-epilogue
+                exit ${E_SUCCESS}
+                ;;
+            --help)
+                help-full
+                exit ${E_SUCCESS}
+                ;;
+            --config-file)
+                shift 1
+                ;;
+            -c | --color)
+                __color_when="${2}"
+                shift 1
+                ;;
+            -*)
+                echo "error: unknown option: ${1}" >&2
+                return ${E_INVALID_OPTION}
+                ;;
+            *)
+                ACTION="${1}"
+                shift 1
+                break
+                ;;
+        esac
+        shift 1
+    done
+
+    # Collect remaining arguments for the action
+    ACTION_ARGS=("${@}")
+
+    # Ensure an action was specified
+    if [[ -z "${ACTION}" ]]; then
+        echo "error: no action specified" >&2
+        help-full >&2
+        return ${E_INVALID_ACTION}
+    fi
+
+    # Set up colors
+    case "${__color_when}" in
+        on | yes | always)
+            DO_COLOR=true
+            ;;
+        off | no | never)
+            DO_COLOR=false
+            ;;
+        auto)
+            ${__IN_TERMINAL} && DO_COLOR=true || DO_COLOR=false
+            ;;
+        *)
+            echo "error: invalid color mode: ${__color_when}" >&2
+            return ${E_ERROR}
+            ;;
+    esac
+    ${DO_COLOR} && setup-colors || unset-colors
+
+    return ${E_SUCCESS}
+}
+
+
+## core helper functions #######################################################
+################################################################################
+
+function error() {
+    :  'Print error message to stderr'
+    echo "error: ${1}" >&2
+}
+
+function load-env() {
+    :  'Safely load key=value pairs from env/config file'
+    :  'Uses declare to set variables without eval risks'
+    local -- __file="${1}"
+    local -- __key
+    local -- __value
+
+    [[ -f "${__file}" ]] || return 0  # Missing config is not an error
+
+    while IFS='=' read -r __key __value; do
+        # Skip empty lines and comments
+        [[ -z "${__key}" || "${__key}" == \#* ]] && continue
+        # Validate key is a valid variable name
+        [[ "${__key}" =~ ^[A-Z_][A-Z0-9_]*$ ]] || {
+            error "invalid config key: ${__key}"
+            continue
+        }
+        # Use declare -g to set global variable
+        declare -g "${__key}=${__value}"
+    done < "${__file}"
+}
+
+function check-tmux-running() {
+    :  'Verify we are running inside a tmux session'
+    [[ -n "${TMUX:-}" ]] || {
+        error "not running inside a tmux session"
+        return 1
+    }
+    # Verify tmux is responsive
+    tmux display-message -p '#{session_id}' &>/dev/null || {
+        error "tmux session not responding"
+        return 1
+    }
+}
+
+function ensure-directories() {
+    :  'Create required directories if they do not exist'
+    mkdir -p "${MARKER_DIR}" "${LOG_DIR}" || {
+        error "failed to create directories"
+        return 1
+    }
+}
+
+function validate-position() {
+    :  'Validate position argument is side or below'
+    local -- __position="${1}"
+
+    [[ -n "${__position}" ]] || {
+        error "position is required (side or below)"
+        return 1
+    }
+    [[ "${__position}" == "side" || "${__position}" == "below" ]] || {
+        error "position must be 'side' or 'below', got: ${__position}"
+        return 1
+    }
+}
+
+function check-command-exists() {
+    :  'Check if a command exists, with helpful error message'
+    local -- __cmd="${1}"
+    local -- __hint="${2:-}"
+
+    command -v "${__cmd}" &>/dev/null || {
+        if [[ -n "${__hint}" ]]; then
+            error "${__cmd} not found - ${__hint}"
+        else
+            error "${__cmd} not found"
+        fi
+        return 1
+    }
+}
+
+
+## marker management ###########################################################
+################################################################################
+
+function build-marker-path() {
+    :  'Build path to marker file for position'
+    local -- __position="${1}"
+
+    echo "${MARKER_DIR}/${__position}.marker"
+}
+
+function write-marker() {
+    :  'Write MARKER associative array to marker file'
+    :  'Uses atomic write (temp file + rename) to prevent race conditions'
+    local -- __position="${1}"
+    local -- __marker_file
+    local -- __temp_file
+    local -- __key
+
+    __marker_file=$(build-marker-path "${__position}")
+    __temp_file="${__marker_file}.$$"
+    mkdir -p "${MARKER_DIR}"
+
+    for __key in "${!MARKER[@]}"; do
+        printf '%s=%q\n' "${__key}" "${MARKER[${__key}]}"
+    done > "${__temp_file}"
+
+    mv "${__temp_file}" "${__marker_file}"
+}
+
+function read-marker() {
+    :  'Read marker file into MARKER associative array'
+    :  'Values are shell-quoted by write-marker(), so we use eval to unquote'
+    :  'Keys are validated to prevent injection attacks'
+    local -- __marker_file="${1}"
+    local -- __key
+    local -- __value
+
+    [[ -f "${__marker_file}" ]] || return 1
+
+    # Verify file is owned by us (prevent tampering)
+    [[ -O "${__marker_file}" ]] || {
+        error "marker file not owned by current user: ${__marker_file}"
+        return 1
+    }
+
+    MARKER=()
+    while IFS='=' read -r __key __value; do
+        # Skip empty lines
+        [[ -n "${__key}" ]] || continue
+        # Validate key is a safe identifier (lowercase, underscore, digits)
+        [[ "${__key}" =~ ^[a-z_][a-z0-9_]*$ ]] || {
+            error "invalid marker key: ${__key}"
+            continue
+        }
+        # Safely unquote the value (written with printf %q)
+        eval "MARKER[${__key}]=${__value}"
+    done < "${__marker_file}"
+}
+
+function remove-marker() {
+    :  'Remove marker file for position'
+    local -- __position="${1}"
+
+    rm -f "$(build-marker-path "${__position}")"
+}
+
+function pane-exists() {
+    :  'Check if pane ID exists in tmux'
+    local -- __pane_id="${1}"
+
+    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "${__pane_id}"
+}
+
+function clean-stale-markers() {
+    :  'Remove markers for panes that no longer exist'
+    :  'Called at start of every invocation - simplifies logic elsewhere'
+    local -- __marker_file
+
+    [[ -d "${MARKER_DIR}" ]] || return 0
+
+    for __marker_file in "${MARKER_DIR}"/*.marker; do
+        [[ -f "${__marker_file}" ]] || continue
+
+        read-marker "${__marker_file}" || continue
+        if ! pane-exists "${MARKER[pane_id]:-}"; then
+            rm -f "${__marker_file}"
+        fi
+    done
+}
+
+function clean-old-logs() {
+    :  'Remove logs older than LOG_RETENTION_DAYS that are not still active'
+    :  'Called at start of every invocation alongside clean-stale-markers'
+    local -- __marker_file
+    local -- __log_file
+    local -A __active_logs=()
+
+    [[ -d "${LOG_DIR}" ]] || return 0
+
+    # Collect log files from active markers (already cleaned by clean-stale-markers)
+    for __marker_file in "${MARKER_DIR}"/*.marker; do
+        [[ -f "${__marker_file}" ]] || continue
+        read-marker "${__marker_file}" || continue
+        [[ -n "${MARKER[log_file]:-}" ]] && __active_logs["${MARKER[log_file]}"]=1
+    done
+
+    # Find and delete old logs not in active set
+    while IFS= read -r -d '' __log_file; do
+        [[ -z "${__active_logs[${__log_file}]:-}" ]] && rm -f "${__log_file}"
+    done < <(find "${LOG_DIR}" -type f -mtime "+${LOG_RETENTION_DAYS}" -print0 2>/dev/null)
+}
+
+
+## pane management #############################################################
+################################################################################
+
+function get-current-pane-id() {
+    :  'Get the tmux pane ID of the current shell'
+    :  'Used to determine which pane to split from'
+    local -- __pid
+    local -- __tty_name
+    local -- __pane_id
+    local -- __pane_list
+
+    # Fast path: TMUX_PANE is set
+    if [[ -n "${TMUX_PANE:-}" ]]; then
+        echo "${TMUX_PANE}"
+        return 0
+    fi
+
+    # Fallback: walk process tree to find tty
+    __pid=$$
+    __tty_name=""
+    while [[ ${__pid} -gt 1 ]]; do
+        __tty_name=$(ps -o tty= -p "${__pid}" 2>/dev/null | tr -d ' ')
+        if [[ -n "${__tty_name}" && "${__tty_name}" != "?" ]]; then
+            break
+        fi
+        __pid=$(ps -o ppid= -p "${__pid}" 2>/dev/null | tr -d ' ')
+    done
+
+    [[ -n "${__tty_name}" && "${__tty_name}" != "?" ]] || {
+        error "could not determine current tty"
+        return 1
+    }
+
+    # Match tty to tmux pane
+    __pane_list=$(tmux list-panes -a -F '#{pane_id} #{pane_tty}' 2>/dev/null)
+    __pane_id=$(grep "/dev/${__tty_name}$" <<< "${__pane_list}" | head -1 | cut -d' ' -f1)
+
+    [[ -n "${__pane_id}" ]] || {
+        error "could not find tmux pane for tty ${__tty_name}"
+        return 1
+    }
+
+    echo "${__pane_id}"
+}
+
+function find-pane-at-position() {
+    :  'Find pane ID at position, with marker -> title fallback'
+    :  'Sets globals: FOUND_PANE_ID, FOUND_VIA (marker|title)'
+    :  'Returns 1 if no pane found at position'
+    local -- __position="${1}"
+    local -- __marker_file
+    local -- __expected_title
+    local -- __window_id
+    local -- __pane_info
+
+    FOUND_PANE_ID=""
+    FOUND_VIA=""
+
+    __marker_file=$(build-marker-path "${__position}")
+    __expected_title="claude-pane:${__position}"
+
+    # 1. Try marker file first (also validates pane still exists)
+    if read-marker "${__marker_file}" 2>/dev/null && pane-exists "${MARKER[pane_id]:-}"; then
+        FOUND_PANE_ID="${MARKER[pane_id]}"
+        FOUND_VIA="marker"
+        return 0
+    fi
+
+    # Marker exists but pane doesn't - stale, remove it
+    [[ -f "${__marker_file}" ]] && rm -f "${__marker_file}"
+
+    # 2. Fallback: search current window for pane with expected title
+    __window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null) || return 1
+
+    # List panes in current window with their titles
+    __pane_info=$(tmux list-panes -t "${__window_id}" -F '#{pane_id}	#{pane_title}' 2>/dev/null \
+        | grep -F "	${__expected_title}$" \
+        | head -1)
+
+    if [[ -n "${__pane_info}" ]]; then
+        FOUND_PANE_ID="${__pane_info%%	*}"
+        FOUND_VIA="title"
+        return 0
+    fi
+
+    return 1
+}
+
+
+## action functions ############################################################
+################################################################################
+
+### help action ################################################################
+
+function __action-help-help() {
+    :  'Print help for the help action'
+    echo "usage: $(basename "${0}") help [<action>]"
+    echo
+    echo "Display help for the specified action or for $(basename "${0}") if no"
+    echo "action is specified."
+}
+
+function __action-help-parse-args() {
+    :  'Parse arguments for the help action'
+    HELP_ACTION=""
+
+    while [[ ${#} -gt 0 ]]; do
+        case "${1}" in
+            -h | --help)
+                __action-help-help
+                exit ${E_SUCCESS}
+                ;;
+            -*)
+                error "unknown option: ${1}"
+                return ${E_INVALID_OPTION}
+                ;;
+            *)
+                HELP_ACTION="${1}"
+                ;;
+        esac
+        shift 1
+    done
+
+    return ${E_SUCCESS}
+}
+
+function __action-help() {
+    :  'Display help for the specified action'
+    local -- __help_func
+
+    if [[ -n "${HELP_ACTION}" ]]; then
+        __help_func="__action-${HELP_ACTION}-help"
+        if type -t "${__help_func}" &>/dev/null; then
+            "${__help_func}"
+        else
+            error "no help found for action: ${HELP_ACTION}"
+            return ${E_INVALID_ACTION}
+        fi
+    else
+        help-full
+    fi
+}
+
+
+### run action #################################################################
+
+function __action-run-help() {
+    :  'Print help for the run action'
+    cat << 'EOF'
+usage: claude-pane run <position> [options] <content-source>
+
+Create or replace pane at position.
 
 REQUIRED:
-  position <side|below>       Where to open the pane
+  position <side|below>       where to open the pane
 
 CONTENT SOURCE (one required):
-  --command '<cmd>'           Run arbitrary command (use '-' to read from stdin)
-  --follow <file>             Shorthand for tail -f <file>
-  --run-in-blocks <script>    Run script via block-run (notebook-style)
+  --command '<cmd>'           run arbitrary command (use '-' to read from stdin)
+  --follow <file>             shorthand for tail -f <file> (repeatable)
+  --run-in-blocks <script>    run script via block-run (notebook-style)
+  --view <file>               view file in less (uses lessfilter if available)
 
 OPTIONS:
-  --title "..."               Label shown at top of pane
-  --page                      Pipe through less -R with mouse scrolling
-  --no-page                   Disable paging (--run-in-blocks enables by default)
-  --log                       Capture output via script(1)
-  --interactive               Skip script(1) wrapping (for interactive commands)
-  --full                      Pane spans full window width/height
-  --no-full                   Pane splits current pane only (default)
-
-  Note: --run-in-blocks enables --page by default so output starts at top
-  Note: Set CREATE_FULL_PANES=true in ~/.claude-pane.conf to default to --full
+  --title "..."               label shown at top of pane
+  --page                      pipe through less -R with mouse scrolling
+  --no-page                   disable paging (default for most, except --run-in-blocks)
+  --interactive               enable stdin for interactive commands
+  --pipefail                  enable pipefail (default)
+  --no-pipefail               disable pipefail
+  --full                      pane spans full window width/height
+  --no-full                   pane splits current pane only (default)
 
 EXAMPLES:
   claude-pane run side --title "SQL JOINs" --command './demo.sql'
   claude-pane run below --follow /var/log/nginx/access.log
   claude-pane run side --page --command 'docker images'
+  claude-pane run side --view ~/.bashrc         # syntax-highlighted if lessfilter exists
 
   # Read command from stdin (avoids quoting issues):
   claude-pane run side --command - << 'EOF'
   echo "Hello!"
   EOF
 EOF
-    if [[ "$IS_INSTALLED_BLOCK_RUN" == "false" ]]; then
-        echo
-        echo "NOTE: --run-in-blocks requires 'block-run'. Install from:"
-        echo "  https://github.com/shitchell/block-run"
-    fi
-    exit "${1:-0}"
 }
 
-usage_kill() {
-    cat <<'EOF'
-claude-pane kill: Close pane at position
+function __action-run-parse-args() {
+    :  'Parse arguments for the run action'
+    local -- __arg
 
-USAGE:
-  claude-pane kill <position>
+    # Reset globals
+    RUN_POSITION=""
+    RUN_COMMAND=""
+    RUN_FOLLOW_FILES=()
+    RUN_BLOCKS_SCRIPT=""
+    RUN_VIEW_FILE=""
+    RUN_TITLE=""
+    DO_PAGE=false
+    DO_PAGE_EXPLICIT=false
+    DO_INTERACTIVE=false
+    DO_PIPEFAIL=true
+    DO_FULL="${CREATE_FULL_PANES}"
 
-REQUIRED:
-  position <side|below>       Position of pane to close
-EOF
-    exit "${1:-0}"
-}
-
-die() {
-    echo "${RED}error:${RESET} $*" >&2
-    exit 1
-}
-
-#-----------------------------------------------------------------------------
-# Marker file management
-#-----------------------------------------------------------------------------
-
-marker_path() {
-    local position="$1"
-    echo "$MARKER_DIR/${position}.marker"
-}
-
-read_marker() {
-    local marker_file="$1"
-    [[ -f "$marker_file" ]] || return 1
-    source "$marker_file"
-}
-
-write_marker() {
-    local position="$1"
-    local pane_id="$2"
-    local title="${3:-}"
-    local command="${4:-}"
-
-    mkdir -p "$MARKER_DIR"
-    local marker_file
-    marker_file=$(marker_path "$position")
-
-    local tty=""
-    tty=$(tmux display-message -t "$pane_id" -p '#{pane_tty}' 2>/dev/null) || true
-
-    # Use printf %q to safely escape values for sourcing
-    printf 'PANE_ID=%q\n' "$pane_id" > "$marker_file"
-    printf 'TITLE=%q\n' "$title" >> "$marker_file"
-    printf 'TTY=%q\n' "$tty" >> "$marker_file"
-    printf 'COMMAND=%q\n' "$command" >> "$marker_file"
-}
-
-remove_marker() {
-    local position="$1"
-    local marker_file
-    marker_file=$(marker_path "$position")
-    rm -f "$marker_file"
-}
-
-# Check if pane from marker still exists
-pane_exists() {
-    local pane_id="$1"
-    tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -qx "$pane_id"
-}
-
-#-----------------------------------------------------------------------------
-# Find current pane (for splitting)
-#-----------------------------------------------------------------------------
-
-find_current_pane() {
-    # If TMUX_PANE is set, use it
-    if [[ -n "${TMUX_PANE:-}" ]]; then
-        echo "$TMUX_PANE"
-        return 0
-    fi
-
-    # Walk process tree to find tty
-    local pid=$$ tty_name=""
-    while [[ $pid -gt 1 ]]; do
-        tty_name=$(ps -o tty= -p "$pid" 2>/dev/null | tr -d ' ')
-        if [[ -n "$tty_name" && "$tty_name" != "?" ]]; then
-            break
-        fi
-        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
-    done
-
-    [[ -n "$tty_name" && "$tty_name" != "?" ]] || {
-        die "could not determine current tty"
-    }
-
-    # Match tty to tmux pane
-    local pane_id
-    pane_id=$(tmux list-panes -a -F '#{pane_id} #{pane_tty}' 2>/dev/null \
-        | grep "/dev/${tty_name}$" \
-        | awk '{print $1}' \
-        | head -1)
-
-    [[ -n "$pane_id" ]] || {
-        die "could not find tmux pane for tty $tty_name"
-    }
-
-    echo "$pane_id"
-}
-
-#-----------------------------------------------------------------------------
-# Command wrapping
-#-----------------------------------------------------------------------------
-
-# Build the wrapped command with header, footer, q-to-close
-# Note: We use $'\e[..m' syntax for colors so they survive quoting layers
-wrap_command() {
-    local cmd="$1"
-    local title="${2:-}"
-    local header_instructions="${3:-}"
-    local use_page="${4:-false}"
-    local use_log="${5:-false}"
-    local log_file="${6:-}"
-
-    local wrapped=""
-
-    # Build header content
-    local header=""
-    if [[ -n "$title" ]]; then
-        header+="printf '%s\\n' \$'\\e[36m=== $title ===\\e[0m'; "
-    fi
-    if [[ -n "$header_instructions" ]]; then
-        header+="printf '%s\\n' \$'\\e[2m$header_instructions\\e[0m'; "
-    fi
-    if [[ -n "$title" || -n "$header_instructions" ]]; then
-        header+="echo; "
-    fi
-
-    # Main command (with optional paging)
-    if [[ "$use_page" == "true" ]]; then
-        # Include header in pipe, redirect cmd stdin from /dev/null to prevent
-        # processes (like node) from interfering with less's keyboard input
-        wrapped+="{ ${header}{ $cmd; } < /dev/null; } 2>&1 | less -R --mouse; EXIT_CODE=\${PIPESTATUS[0]}; "
-    else
-        wrapped+="${header}$cmd; EXIT_CODE=\$?; "
-    fi
-
-    # Footer: exit code + q to close
-    wrapped+="echo; "
-    wrapped+="printf '%s ' \$'\\e[2m(exit code: '\"\$EXIT_CODE\"\$')\\e[0m'; "
-    wrapped+="printf '%s\\n' \$'Press \\e[36mq\\e[0m to close'; "
-    wrapped+="while IFS= read -rsn1 key; do [[ \"\$key\" == \"q\" ]] && break; done"
-
-    # Wrap in script(1) for logging if requested
-    if [[ "$use_log" == "true" && -n "$log_file" ]]; then
-        mkdir -p "$LOG_DIR"
-        # Escape single quotes in wrapped command
-        local escaped_wrapped="${wrapped//\'/\'\\\'\'}"
-        echo "script -q '$log_file' -c 'bash -c '\''$escaped_wrapped'\'''"
-    else
-        echo "$wrapped"
-    fi
-}
-
-#-----------------------------------------------------------------------------
-# run command
-#-----------------------------------------------------------------------------
-
-cmd_run() {
-    local position=""
-    local title=""
-    local command=""
-    local follow_file=""
-    local blocks_script=""
-    local use_page=false
-    local page_explicit=false  # track if --page or --no-page was explicitly set
-    local use_log=false
-    local use_interactive=false
-    local use_full="$CREATE_FULL_PANES"  # default from config or false
-
-    # Parse arguments
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help|-h)
-                usage_run 0
+    while [[ ${#} -gt 0 ]]; do
+        __arg="${1}"
+        case "${__arg}" in
+            -h | --help)
+                __action-run-help
+                exit ${E_SUCCESS}
                 ;;
             --title)
-                [[ -n "${2:-}" ]] || die "--title requires an argument"
-                title="$2"
-                shift 2
+                [[ -n "${2:-}" ]] || { error "--title requires an argument"; return 1; }
+                RUN_TITLE="${2}"
+                shift
                 ;;
             --command)
-                [[ -n "${2:-}" ]] || die "--command requires an argument"
-                command="$2"
-                shift 2
+                [[ -n "${2:-}" ]] || { error "--command requires an argument"; return 1; }
+                RUN_COMMAND="${2}"
+                shift
                 ;;
             --follow)
-                [[ -n "${2:-}" ]] || die "--follow requires an argument"
-                follow_file="$2"
-                shift 2
+                [[ -n "${2:-}" ]] || { error "--follow requires an argument"; return 1; }
+                RUN_FOLLOW_FILES+=("${2}")
+                shift
                 ;;
             --run-in-blocks)
-                [[ -n "${2:-}" ]] || die "--run-in-blocks requires an argument"
-                blocks_script="$2"
-                shift 2
+                [[ -n "${2:-}" ]] || { error "--run-in-blocks requires an argument"; return 1; }
+                RUN_BLOCKS_SCRIPT="${2}"
+                shift
+                ;;
+            --view)
+                [[ -n "${2:-}" ]] || { error "--view requires an argument"; return 1; }
+                RUN_VIEW_FILE="${2}"
+                shift
                 ;;
             --page)
-                use_page=true
-                page_explicit=true
-                shift
+                DO_PAGE=true
+                DO_PAGE_EXPLICIT=true
                 ;;
             --no-page)
-                use_page=false
-                page_explicit=true
-                shift
-                ;;
-            --log)
-                use_log=true
-                shift
-                ;;
-            --full)
-                use_full=true
-                shift
-                ;;
-            --no-full)
-                use_full=false
-                shift
+                DO_PAGE=false
+                DO_PAGE_EXPLICIT=true
                 ;;
             --interactive)
-                use_interactive=true
-                shift
+                DO_INTERACTIVE=true
+                ;;
+            --pipefail)
+                DO_PIPEFAIL=true
+                ;;
+            --no-pipefail)
+                DO_PIPEFAIL=false
+                ;;
+            --full)
+                DO_FULL=true
+                ;;
+            --no-full)
+                DO_FULL=false
                 ;;
             -*)
-                die "unknown option: $1"
+                error "unknown option: ${__arg}"
+                return ${E_INVALID_OPTION}
                 ;;
             *)
-                if [[ -z "$position" ]]; then
-                    position="$1"
+                if [[ -z "${RUN_POSITION}" ]]; then
+                    RUN_POSITION="${__arg}"
                 else
-                    die "unexpected argument: $1"
+                    error "unexpected argument: ${__arg}"
+                    return 1
                 fi
-                shift
                 ;;
         esac
+        shift
     done
 
-    # Validate position
-    [[ -n "$position" ]] || die "position is required (side or below)"
-    [[ "$position" == "side" || "$position" == "below" ]] || die "position must be 'side' or 'below'"
-
-    # Validate content source (exactly one required)
-    local source_count=0
-    [[ -n "$command" ]] && ((++source_count))
-    [[ -n "$follow_file" ]] && ((++source_count))
-    [[ -n "$blocks_script" ]] && ((++source_count))
-
-    [[ $source_count -eq 1 ]] || die "exactly one content source required (--command, --follow, or --run-in-blocks)"
+    # Handle --command - (read from stdin)
+    if [[ "${RUN_COMMAND}" == "-" ]]; then
+        if [[ -t 0 ]]; then
+            error "--command - requires input from stdin (use heredoc or pipe)"
+            return 1
+        fi
+        RUN_COMMAND=$(cat)
+    fi
 
     # Default to paging for --run-in-blocks (unless explicitly disabled)
-    if [[ -n "$blocks_script" && "$page_explicit" == "false" ]]; then
-        use_page=true
+    if [[ -n "${RUN_BLOCKS_SCRIPT}" && "${DO_PAGE_EXPLICIT}" == "false" ]]; then
+        DO_PAGE=true
     fi
 
-    # Handle --command - (read from stdin)
-    if [[ "$command" == "-" ]]; then
-        if [[ -t 0 ]]; then
-            die "--command - requires input from stdin (use heredoc or pipe)"
-        fi
-        command=$(cat)
+    # --view requires interactive mode (less needs keyboard input)
+    if [[ -n "${RUN_VIEW_FILE}" ]]; then
+        DO_INTERACTIVE=true
     fi
 
-    # Warn about common quoting issues
-    if [[ -n "$command" ]]; then
-        if [[ "$command" == *'\\!'* ]]; then
-            echo "${YELLOW}warning:${RESET} command contains '\\!' - this may be a quoting issue" >&2
-            echo "  tip: use single quotes or --command - with heredoc" >&2
-        fi
+    # Validate
+    __action-run-validate-args || return ${?}
+
+    return ${E_SUCCESS}
+}
+
+function __action-run-validate-args() {
+    :  'Validate run arguments'
+    local -i __source_count=0
+
+    # Position is valid
+    validate-position "${RUN_POSITION}" || return 1
+
+    # Exactly one content source
+    [[ -n "${RUN_COMMAND}" ]] && (( ++__source_count ))
+    [[ ${#RUN_FOLLOW_FILES[@]} -gt 0 ]] && (( ++__source_count ))
+    [[ -n "${RUN_BLOCKS_SCRIPT}" ]] && (( ++__source_count ))
+    [[ -n "${RUN_VIEW_FILE}" ]] && (( ++__source_count ))
+
+    [[ ${__source_count} -eq 1 ]] || {
+        error "exactly one content source required (--command, --follow, --run-in-blocks, or --view)"
+        return 1
+    }
+
+    # Files exist for --follow
+    if [[ ${#RUN_FOLLOW_FILES[@]} -gt 0 ]]; then
+        local -- __file
+        for __file in "${RUN_FOLLOW_FILES[@]}"; do
+            [[ -f "${__file}" || -p "${__file}" ]] || {
+                error "file not found: ${__file}"
+                return 1
+            }
+        done
     fi
 
-    # --interactive disables --log
-    if [[ "$use_interactive" == "true" ]]; then
-        use_log=false
+    # File exists and block-run available for --run-in-blocks
+    if [[ -n "${RUN_BLOCKS_SCRIPT}" ]]; then
+        [[ -f "${RUN_BLOCKS_SCRIPT}" ]] || {
+            error "script not found: ${RUN_BLOCKS_SCRIPT}"
+            return 1
+        }
+        check-command-exists "block-run" "install from https://github.com/shitchell/block-run" || return 1
     fi
 
-    # Build the actual command
-    local actual_cmd=""
-    local header_instructions=""
-
-    if [[ -n "$follow_file" ]]; then
-        [[ -f "$follow_file" || -p "$follow_file" ]] || die "file not found: $follow_file"
-        actual_cmd="tail -f '$follow_file'"
-        header_instructions="(Ctrl+C to stop)"
-    elif [[ -n "$blocks_script" ]]; then
-        [[ "$IS_INSTALLED_BLOCK_RUN" == "true" ]] || die "--run-in-blocks requires 'block-run'. Install from: https://github.com/shitchell/block-run"
-        [[ -f "$blocks_script" ]] || die "script not found: $blocks_script"
-        actual_cmd="block-run '$blocks_script'"
-    else
-        actual_cmd="$command"
+    # File exists for --view
+    if [[ -n "${RUN_VIEW_FILE}" ]]; then
+        [[ -e "${RUN_VIEW_FILE}" ]] || {
+            error "file not found: ${RUN_VIEW_FILE}"
+            return 1
+        }
     fi
 
-    if [[ "$use_page" == "true" ]]; then
-        header_instructions="(scroll: mouse/arrows, q to quit)"
-    fi
+    # --interactive and --page are mutually exclusive
+    ${DO_INTERACTIVE} && ${DO_PAGE} && {
+        error "--interactive and --page are mutually exclusive"
+        return 1
+    }
 
-    # Generate log file name if logging
-    local log_file=""
-    if [[ "$use_log" == "true" ]]; then
-        local timestamp
-        timestamp=$(date +%Y%m%d-%H%M%S)
-        local cmd_slug
-        cmd_slug=$(echo "$actual_cmd" | tr -cs '[:alnum:]' '_' | head -c 50)
-        log_file="$LOG_DIR/${timestamp}-${cmd_slug}.log"
-    fi
+    # --view and --page are mutually exclusive (--view uses less internally)
+    [[ -n "${RUN_VIEW_FILE}" ]] && ${DO_PAGE} && {
+        error "--view and --page are mutually exclusive (--view uses less internally)"
+        return 1
+    }
 
-    # Wrap the command
-    local wrapped_cmd
-    if [[ "$use_interactive" == "true" ]]; then
-        # Minimal wrapping for interactive - just header/footer, no script
-        wrapped_cmd=$(wrap_command "$actual_cmd" "$title" "$header_instructions" "$use_page" false "")
-    else
-        wrapped_cmd=$(wrap_command "$actual_cmd" "$title" "$header_instructions" "$use_page" "$use_log" "$log_file")
-    fi
+    return ${E_SUCCESS}
+}
 
-    # Find source pane
-    local source_pane
-    source_pane=$(find_current_pane)
+function __action-run-build-command() {
+    :  'Transform content source into COMMAND_RAW and COMMAND_BUILT'
 
-    # Check for existing pane at position
-    local marker_file
-    marker_file=$(marker_path "$position")
-
-    local existing_pane=""
-    if [[ -f "$marker_file" ]]; then
-        read_marker "$marker_file"
-        if pane_exists "$PANE_ID"; then
-            existing_pane="$PANE_ID"
+    if [[ -n "${RUN_COMMAND}" ]]; then
+        COMMAND_RAW="${RUN_COMMAND}"
+        COMMAND_BUILT="${COMMAND_RAW}"
+    elif [[ ${#RUN_FOLLOW_FILES[@]} -gt 0 ]]; then
+        COMMAND_RAW="${RUN_FOLLOW_FILES[*]}"
+        COMMAND_BUILT="tail -f ${RUN_FOLLOW_FILES[*]@Q}"
+    elif [[ -n "${RUN_BLOCKS_SCRIPT}" ]]; then
+        COMMAND_RAW="${RUN_BLOCKS_SCRIPT}"
+        COMMAND_BUILT="block-run ${RUN_BLOCKS_SCRIPT@Q}"
+    elif [[ -n "${RUN_VIEW_FILE}" ]]; then
+        COMMAND_RAW="${RUN_VIEW_FILE}"
+        # Use lessfilter if available for syntax highlighting, otherwise plain less
+        if command -v lessfilter &>/dev/null; then
+            COMMAND_BUILT="lessfilter ${RUN_VIEW_FILE@Q} | less -R"
         else
-            # Stale marker
-            remove_marker "$position"
+            COMMAND_BUILT="less ${RUN_VIEW_FILE@Q}"
         fi
-    fi
-
-    local new_pane_id=""
-
-    # Write command to temp script to avoid quoting hell
-    local cmd_script
-    cmd_script=$(mktemp "$MARKER_DIR/cmd.XXXXXX.sh")
-    chmod 755 "$cmd_script"
-    cat > "$cmd_script" << CMDEOF
-#!/usr/bin/env bash
-$wrapped_cmd
-rm -f "\$0"  # self-delete
-CMDEOF
-
-    if [[ -n "$existing_pane" ]]; then
-        # Respawn existing pane
-        tmux respawn-pane -t "$existing_pane" -k "$cmd_script"
-        new_pane_id="$existing_pane"
-        echo "respawned pane $new_pane_id at position '$position'"
-    else
-        # Create new pane
-        # -f = full width/height (span entire window edge, not just current pane)
-        local split_opts=""
-        local full_flag=""
-        [[ "$use_full" == "true" ]] && full_flag="f"
-
-        case "$position" in
-            side)  split_opts="-h${full_flag}" ;;   # horizontal split
-            below) split_opts="-v${full_flag}" ;;   # vertical split
-        esac
-
-        new_pane_id=$(tmux split-window $split_opts -t "$source_pane" -P -F '#{pane_id}' "$cmd_script")
-        echo "opened pane $new_pane_id at position '$position'"
-    fi
-
-    # Write marker
-    write_marker "$position" "$new_pane_id" "$title" "$actual_cmd"
-
-    if [[ "$use_log" == "true" ]]; then
-        echo "logging to: $log_file"
     fi
 }
 
-#-----------------------------------------------------------------------------
-# kill command
-#-----------------------------------------------------------------------------
+function __action-run-build-paths() {
+    :  'Build log, timing, and script paths with shared identifiers'
+    local -- __timestamp
+    local -- __slug
 
-cmd_kill() {
-    local position=""
+    __timestamp=$(date +%H%M%S%3N)  # HHMMSS + 3 digits of nanoseconds (sub-ms precision)
+    __slug=$(printf '%s' "${COMMAND_RAW:-unknown}" | tr -cs '[:alnum:]' '_' | cut -c1-50)
 
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --help|-h)
-                usage_kill 0
+    LOG_FILE="${LOG_DIR}/${__timestamp}-${__slug}.script.log"
+    LOG_TIMING_FILE="${LOG_DIR}/${__timestamp}-${__slug}.timing"
+    SCRIPT_FILE="${LOG_DIR}/${__timestamp}-${__slug}.sh"
+}
+
+function __action-run-build-wrapped-command() {
+    :  'Build COMMAND_FINAL with script() wrapper'
+    local -- __script_opts
+
+    # script options: -q (quiet), -e (return exit), -f (flush)
+    # -c must be separate as it takes an argument
+    # -T (timing log), -o (size limit)
+    __script_opts="-qe"
+    ${DO_INTERACTIVE} || __script_opts+="f"
+
+    # Build command string - only quote values that need it, not options
+    # -c must be followed by its argument (the command)
+    COMMAND_FINAL="script ${__script_opts} -c ${COMMAND_BUILT@Q}"
+    COMMAND_FINAL+=" -T ${LOG_TIMING_FILE@Q}"
+    COMMAND_FINAL+=" -o ${LOG_SIZE_LIMIT@Q}"
+    COMMAND_FINAL+=" ${LOG_FILE@Q}"
+
+    # Add </dev/null for non-interactive to prevent input stealing
+    ${DO_INTERACTIVE} || COMMAND_FINAL+=" </dev/null"
+}
+
+function __action-run-build-post-process-string() {
+    :  'Build post-process string to append after command'
+    :  'Returns " | less -R" or "" etc.'
+
+    if ${DO_PAGE}; then
+        echo " | less -R"
+    else
+        echo ""
+    fi
+}
+
+function __action-run-generate-script() {
+    :  'Generate the temp script that runs in the pane'
+    local -- __post_process
+
+    __post_process=$(__action-run-build-post-process-string)
+
+    {
+        printf '%s\n' '#!/usr/bin/env bash'
+
+        # Pipefail
+        ${DO_PIPEFAIL} && printf '%s\n' 'set -o pipefail'
+
+        # Colors for exit display (embedded)
+        printf '%s\n' "S_DIM=\$'\\e[2m'"
+        printf '%s\n' "S_RESET=\$'\\e[0m'"
+        printf '%s\n' "C_CYAN=\$'\\e[36m'"
+
+        # Exit trap
+        printf '%s\n' '__exit_code=0'
+        printf '%s\n' 'trap '"'"'__on_exit'"'"' EXIT'
+        printf '%s\n' ''
+        printf '%s\n' '__on_exit() {'
+        printf '%s\n' '    echo'
+        printf '%s\n' '    echo "${S_DIM}(exit code: ${__exit_code})${S_RESET}"'
+
+        # Only show q-to-quit and read loop if not paging
+        if ! ${DO_PAGE}; then
+            printf '%s\n' '    echo "${S_DIM}Press ${C_CYAN}q${S_RESET}${S_DIM} to exit${S_RESET}"'
+            printf '%s\n' '    while IFS= read -rsn1 __key; do [[ "${__key}" == "q" ]] && break; done'
+        fi
+
+        printf '%s\n' '}'
+        printf '%s\n' ''
+
+        # When paging, title and instructions must be INSIDE the subshell that pipes to less
+        # (otherwise less takes over the screen and hides them)
+        if ${DO_PAGE}; then
+            # Build header content to include in the piped subshell
+            printf '%s' '{'
+            if [[ -n "${RUN_TITLE}" ]]; then
+                printf '%s' " echo \"\${C_CYAN}=== ${RUN_TITLE} ===\${S_RESET}\";"
+                printf '%s' ' echo;'
+            fi
+            printf '%s' ' echo "${S_DIM}(scroll: arrows/mouse, q to quit)${S_RESET}";'
+            printf '%s' ' echo;'
+            printf '%s' " ${COMMAND_FINAL};"
+            printf '%s\n' " }${__post_process}"
+        else
+            # Non-paging: title can be echoed directly before command
+            if [[ -n "${RUN_TITLE}" ]]; then
+                printf '%s\n' "echo \"\${C_CYAN}=== ${RUN_TITLE} ===\${S_RESET}\""
+                printf '%s\n' 'echo'
+            fi
+            # Follow mode instructions (Ctrl+C to stop tail, then q to quit)
+            if [[ ${#RUN_FOLLOW_FILES[@]} -gt 0 ]]; then
+                printf '%s\n' 'echo "${S_DIM}(Ctrl+C to stop, then q to quit)${S_RESET}"'
+                printf '%s\n' 'echo'
+            fi
+            printf '%s\n' "(${COMMAND_FINAL})${__post_process}"
+        fi
+        printf '%s\n' '__exit_code=${PIPESTATUS[0]}'
+
+    } > "${SCRIPT_FILE}"
+
+    chmod 700 "${SCRIPT_FILE}"
+}
+
+function __action-run-create-or-update-pane() {
+    :  'Create new pane or respawn existing at position'
+    local -- __source_pane
+    local -- __marker_file
+    local -- __new_pane_id=""
+    local -- __message
+    local -- __is_respawn=false
+    local -a __tmux_args=()
+
+    __source_pane=$(get-current-pane-id) || return 1
+    __marker_file=$(build-marker-path "${RUN_POSITION}")
+
+    # Check if we should respawn (marker exists AND pane still exists)
+    if read-marker "${__marker_file}" 2>/dev/null && pane-exists "${MARKER[pane_id]:-}"; then
+        # Existing pane - respawn it
+        __tmux_args=(respawn-pane -t "${MARKER[pane_id]}" -k "${SCRIPT_FILE}")
+        __new_pane_id="${MARKER[pane_id]}"
+        __message="respawned pane"
+        __is_respawn=true
+    else
+        # New pane - create it
+        # Build split args as array for proper quoting
+        __tmux_args=(split-window)
+        case "${RUN_POSITION}" in
+            side)  __tmux_args+=(-h) ;;
+            below) __tmux_args+=(-v) ;;
+        esac
+        ${DO_FULL} && __tmux_args+=(-f)
+        __tmux_args+=(-t "${__source_pane}" -P -F '#{pane_id}' "${SCRIPT_FILE}")
+        __message="opened pane"
+    fi
+
+    # Execute tmux command
+    if ${__is_respawn}; then
+        tmux "${__tmux_args[@]}" || { error "failed to respawn pane"; return 1; }
+    else
+        __new_pane_id=$(tmux "${__tmux_args[@]}") || { error "failed to create pane"; return 1; }
+    fi
+
+    # Set pane title for fallback discovery (if marker goes missing)
+    tmux select-pane -t "${__new_pane_id}" -T "claude-pane:${RUN_POSITION}"
+
+    # Update marker
+    MARKER=(
+        [pane_id]="${__new_pane_id}"
+        [title]="${RUN_TITLE}"
+        [command]="${COMMAND_RAW}"
+        [log_file]="${LOG_FILE}"
+        [script_file]="${SCRIPT_FILE}"
+    )
+    write-marker "${RUN_POSITION}"
+
+    # Output
+    echo "${__message} ${__new_pane_id} at position '${RUN_POSITION}'"
+    echo "log: ${LOG_FILE}"
+    echo "script: ${SCRIPT_FILE}"
+}
+
+function __action-run() {
+    :  'Create or replace pane at position'
+
+    # 1. Build command stages
+    __action-run-build-command  # COMMAND_RAW -> COMMAND_BUILT
+
+    # 2. Build paths (log, timing, script - all share timestamp/slug)
+    __action-run-build-paths
+
+    # 3. Build final wrapped command
+    __action-run-build-wrapped-command  # -> COMMAND_FINAL
+
+    # 4. Generate temp script
+    __action-run-generate-script  # writes to SCRIPT_FILE
+
+    # 5. Create or update pane
+    __action-run-create-or-update-pane || return ${?}
+}
+
+
+### kill action ################################################################
+
+function __action-kill-help() {
+    :  'Print help for the kill action'
+    cat << 'EOF'
+usage: claude-pane kill <position>
+
+Close pane at position.
+
+REQUIRED:
+  position <side|below>    position of pane to close
+EOF
+}
+
+function __action-kill-parse-args() {
+    :  'Parse arguments for kill action'
+    local -- __arg
+
+    KILL_POSITION=""
+
+    while [[ ${#} -gt 0 ]]; do
+        __arg="${1}"
+        case "${__arg}" in
+            -h | --help)
+                __action-kill-help
+                exit ${E_SUCCESS}
                 ;;
             -*)
-                die "unknown option: $1"
+                error "unknown option: ${__arg}"
+                return ${E_INVALID_OPTION}
                 ;;
             *)
-                if [[ -z "$position" ]]; then
-                    position="$1"
+                if [[ -z "${KILL_POSITION}" ]]; then
+                    KILL_POSITION="${__arg}"
                 else
-                    die "unexpected argument: $1"
+                    error "unexpected argument: ${__arg}"
+                    return 1
                 fi
-                shift
                 ;;
         esac
+        shift
     done
 
-    [[ -n "$position" ]] || die "position is required (side or below)"
-    [[ "$position" == "side" || "$position" == "below" ]] || die "position must be 'side' or 'below'"
+    # Validate
+    validate-position "${KILL_POSITION}" || return 1
 
-    local marker_file
-    marker_file=$(marker_path "$position")
+    return ${E_SUCCESS}
+}
 
-    if [[ ! -f "$marker_file" ]]; then
-        echo "no pane at position '$position'"
+function __action-kill() {
+    :  'Close pane at position'
+
+    if ! find-pane-at-position "${KILL_POSITION}"; then
+        echo "no pane at position '${KILL_POSITION}'"
         return 0
     fi
 
-    read_marker "$marker_file"
-
-    if pane_exists "$PANE_ID"; then
-        tmux kill-pane -t "$PANE_ID"
-        echo "killed pane $PANE_ID at position '$position'"
-    else
-        echo "pane $PANE_ID was already closed"
+    # Report how we found it
+    if [[ "${FOUND_VIA}" == "title" ]]; then
+        echo "warning: marker file missing, but found pane ${FOUND_PANE_ID} by title 'claude-pane:${KILL_POSITION}'" >&2
     fi
 
-    remove_marker "$position"
+    # Kill the pane
+    tmux kill-pane -t "${FOUND_PANE_ID}" || { error "failed to kill pane"; return 1; }
+
+    # Clean up marker (if it existed)
+    remove-marker "${KILL_POSITION}"
+
+    echo "killed pane ${FOUND_PANE_ID} at position '${KILL_POSITION}'"
 }
 
-#-----------------------------------------------------------------------------
-# list command
-#-----------------------------------------------------------------------------
 
-cmd_list() {
-    mkdir -p "$MARKER_DIR"
+### list action ################################################################
 
-    local found=false
+function __action-list-help() {
+    :  'Print help for the list action'
+    cat << 'EOF'
+usage: claude-pane list
 
-    for marker_file in "$MARKER_DIR"/*.marker; do
-        [[ -f "$marker_file" ]] || continue
+Show all tracked panes and their status.
+EOF
+}
 
-        local position
-        position=$(basename "$marker_file" .marker)
-
-        read_marker "$marker_file"
-
-        local status
-        if pane_exists "$PANE_ID"; then
-            status="${GREEN}active${RESET}"
-        else
-            status="${YELLOW}stale${RESET}"
-        fi
-
-        echo "${CYAN}$position${RESET}: $PANE_ID ($status)"
-        [[ -n "${TITLE:-}" ]] && echo "  title: $TITLE"
-        [[ -n "${COMMAND:-}" ]] && echo "  command: $COMMAND"
-        echo
-
-        found=true
+function __action-list-parse-args() {
+    :  'Parse arguments for list action'
+    while [[ ${#} -gt 0 ]]; do
+        case "${1}" in
+            -h | --help)
+                __action-list-help
+                exit ${E_SUCCESS}
+                ;;
+            -*)
+                error "unknown option: ${1}"
+                return ${E_INVALID_OPTION}
+                ;;
+            *)
+                error "unexpected argument: ${1}"
+                return 1
+                ;;
+        esac
+        shift
     done
 
-    if [[ "$found" == "false" ]]; then
-        echo "no active panes"
+    return ${E_SUCCESS}
+}
+
+function __action-list() {
+    :  'List all tracked panes and their status'
+    local -- __marker_file
+    local -- __position
+    local -- __status
+    local -- __found=false
+
+    [[ -d "${MARKER_DIR}" ]] || { echo "no active panes"; return 0; }
+
+    for __marker_file in "${MARKER_DIR}"/*.marker; do
+        [[ -f "${__marker_file}" ]] || continue
+
+        __position="${__marker_file##*/}"
+        __position="${__position%.marker}"
+
+        read-marker "${__marker_file}" || continue
+
+        if pane-exists "${MARKER[pane_id]:-}"; then
+            __status="${C_GREEN}active${S_RESET}"
+        else
+            __status="${C_YELLOW}stale${S_RESET}"
+        fi
+
+        echo "${C_CYAN}${__position}${S_RESET}: ${MARKER[pane_id]:-} (${__status})"
+        [[ -n "${MARKER[title]:-}" ]] && echo "  title: ${MARKER[title]}"
+        [[ -n "${MARKER[command]:-}" ]] && echo "  command: ${MARKER[command]}"
+        echo
+
+        __found=true
+    done
+
+    ${__found} || echo "no active panes"
+}
+
+
+### capture action #############################################################
+
+function __action-capture-help() {
+    :  'Print help for the capture action'
+    cat << 'EOF'
+usage: claude-pane capture <position>
+
+Capture and output current pane contents.
+
+REQUIRED:
+  position <side|below>    position of pane to capture
+EOF
+}
+
+function __action-capture-parse-args() {
+    :  'Parse arguments for capture action'
+    local -- __arg
+
+    CAPTURE_POSITION=""
+
+    while [[ ${#} -gt 0 ]]; do
+        __arg="${1}"
+        case "${__arg}" in
+            -h | --help)
+                __action-capture-help
+                exit ${E_SUCCESS}
+                ;;
+            -*)
+                error "unknown option: ${__arg}"
+                return ${E_INVALID_OPTION}
+                ;;
+            *)
+                if [[ -z "${CAPTURE_POSITION}" ]]; then
+                    CAPTURE_POSITION="${__arg}"
+                else
+                    error "unexpected argument: ${__arg}"
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    # Validate
+    validate-position "${CAPTURE_POSITION}" || return 1
+
+    return ${E_SUCCESS}
+}
+
+function __action-capture() {
+    :  'Capture and output current pane contents'
+
+    if ! find-pane-at-position "${CAPTURE_POSITION}"; then
+        error "no pane at position '${CAPTURE_POSITION}'"
+        return 1
     fi
+
+    # Warn if found via fallback
+    if [[ "${FOUND_VIA}" == "title" ]]; then
+        echo "warning: marker file missing, found pane ${FOUND_PANE_ID} by title" >&2
+    fi
+
+    # Capture pane contents
+    tmux capture-pane -t "${FOUND_PANE_ID}" -p
 }
 
-#-----------------------------------------------------------------------------
-# Main
-#-----------------------------------------------------------------------------
 
-main() {
-    [[ $# -gt 0 ]] || usage 1
+### flush action ###############################################################
 
-    local cmd="$1"
-    shift
+function __action-flush-help() {
+    :  'Print help for the flush action'
+    cat << 'EOF'
+usage: claude-pane flush <position>
 
-    case "$cmd" in
-        run)
-            cmd_run "$@"
-            ;;
-        kill)
-            cmd_kill "$@"
-            ;;
-        list)
-            cmd_list "$@"
-            ;;
-        --help|-h)
-            usage 0
-            ;;
-        *)
-            die "unknown command: $cmd (try 'run', 'kill', or 'list')"
-            ;;
-    esac
+Force-flush logs for pane at position.
+Sends SIGUSR1 to the script process to flush output.
+
+REQUIRED:
+  position <side|below>    position of pane to flush
+EOF
 }
 
-main "$@"
+function __action-flush-parse-args() {
+    :  'Parse arguments for flush action'
+    local -- __arg
+
+    FLUSH_POSITION=""
+
+    while [[ ${#} -gt 0 ]]; do
+        __arg="${1}"
+        case "${__arg}" in
+            -h | --help)
+                __action-flush-help
+                exit ${E_SUCCESS}
+                ;;
+            -*)
+                error "unknown option: ${__arg}"
+                return ${E_INVALID_OPTION}
+                ;;
+            *)
+                if [[ -z "${FLUSH_POSITION}" ]]; then
+                    FLUSH_POSITION="${__arg}"
+                else
+                    error "unexpected argument: ${__arg}"
+                    return 1
+                fi
+                ;;
+        esac
+        shift
+    done
+
+    # Validate
+    validate-position "${FLUSH_POSITION}" || return 1
+
+    return ${E_SUCCESS}
+}
+
+function __action-flush() {
+    :  'Force-flush logs for pane at position'
+    local -- __pane_pid
+    local -- __script_pid
+
+    if ! find-pane-at-position "${FLUSH_POSITION}"; then
+        error "no pane at position '${FLUSH_POSITION}'"
+        return 1
+    fi
+
+    # Warn if found via fallback
+    if [[ "${FOUND_VIA}" == "title" ]]; then
+        echo "warning: marker file missing, found pane ${FOUND_PANE_ID} by title" >&2
+    fi
+
+    # Find script process in the pane
+    # Get the pane's PID, then find child script process
+    __pane_pid=$(tmux display-message -t "${FOUND_PANE_ID}" -p '#{pane_pid}')
+
+    # Find script child process
+    __script_pid=$(pgrep -P "${__pane_pid}" -x script 2>/dev/null | head -1)
+
+    [[ -n "${__script_pid}" ]] || { error "no script process found in pane"; return 1; }
+
+    # Send SIGUSR1 to flush
+    kill -USR1 "${__script_pid}" || { error "failed to send flush signal"; return 1; }
+    echo "flushed logs for pane at '${FLUSH_POSITION}'"
+}
+
+
+## main ########################################################################
+################################################################################
+
+function main() {
+    local -- __exit_code=${E_SUCCESS}
+    local -- __action_func
+    local -- __parse_func
+
+    # Parse base arguments (sets ACTION, ACTION_ARGS, colors, etc.)
+    parse-args "${@}" || return ${?}
+
+    # Prerequisites
+    check-tmux-running || return 1
+    load-env "${CONFIG_FILE}"
+    ensure-directories || return 1
+
+    # Housekeeping
+    clean-stale-markers
+    clean-old-logs
+
+    # Dynamic action dispatch
+    __action_func="__action-${ACTION}"
+    __parse_func="__action-${ACTION}-parse-args"
+
+    # Verify the action function exists
+    if ! type -t "${__action_func}" &>/dev/null; then
+        error "unknown action: ${ACTION}"
+        return ${E_INVALID_ACTION}
+    fi
+
+    # Parse action-specific arguments if a parser exists
+    if type -t "${__parse_func}" &>/dev/null; then
+        "${__parse_func}" "${ACTION_ARGS[@]}" || return ${?}
+    fi
+
+    # Call the action function
+    "${__action_func}"
+    __exit_code=${?}
+
+    return ${__exit_code}
+}
+
+
+## run #########################################################################
+################################################################################
+
+[[ "${BASH_SOURCE[0]}" == "${0}" ]] && main "${@}"

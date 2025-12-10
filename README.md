@@ -44,6 +44,9 @@ claude-pane <command> [args]
 | `run <position> [options]` | Create or replace pane at position |
 | `kill <position>` | Close pane at position |
 | `list` | Show active panes |
+| `capture <position>` | Capture pane contents to stdout |
+| `flush <position>` | Force-flush logs for pane |
+| `help [command]` | Show help for a specific command |
 
 ### Positions
 
@@ -61,8 +64,9 @@ claude-pane run <side|below> [options] <content-source>
 | Option | Description |
 |--------|-------------|
 | `--command '<cmd>'` | Run arbitrary command (use `-` to read from stdin) |
-| `--follow <file>` | Tail a file (shorthand for `tail -f`) |
+| `--follow <file>` | Tail a file (shorthand for `tail -f`), repeatable |
 | `--run-in-blocks <script>` | Run script via block-run (notebook-style) |
+| `--view <file>` | View file in less (uses `lessfilter` if available for syntax highlighting) |
 
 ### Options
 
@@ -70,10 +74,12 @@ claude-pane run <side|below> [options] <content-source>
 |--------|-------------|
 | `--title "..."` | Label shown at top of pane |
 | `--page` | Pipe through `less -R` with mouse scrolling |
-| `--log` | Capture output via `script(1)` |
-| `--interactive` | Skip `script(1)` wrapping (for interactive commands) |
+| `--no-page` | Disable paging (default for most sources) |
+| `--interactive` | Enable stdin for interactive commands |
 | `--full` | Pane spans full window width/height |
 | `--no-full` | Pane splits current pane only (default) |
+| `--pipefail` | Enable pipefail in wrapper script (default) |
+| `--no-pipefail` | Disable pipefail |
 
 ## Examples
 
@@ -81,6 +87,12 @@ claude-pane run <side|below> [options] <content-source>
 
 ```bash
 claude-pane run side --page --command 'pygmentize -l python example.py'
+```
+
+### View a file (with lessfilter highlighting if available)
+
+```bash
+claude-pane run side --view ~/.bashrc
 ```
 
 ### Run a script block-by-block
@@ -116,7 +128,13 @@ EOF
 
 Running `claude-pane run side ...` when a side pane already exists will respawn that pane with the new command (no flickering).
 
-### Close a pane
+### Capture pane contents
+
+```bash
+claude-pane capture side > output.txt
+```
+
+### Close panes
 
 ```bash
 claude-pane kill side
@@ -125,23 +143,35 @@ claude-pane kill below
 
 ## Configuration
 
-Create `~/.claude-pane.conf` to set defaults:
+Create `~/.config/claude-pane/config` or `~/.claude-pane.conf` to set defaults:
 
 ```bash
 # Default to full-width/height panes
 CREATE_FULL_PANES=true
+
+# Log size limit (default: 5M)
+LOG_SIZE_LIMIT=10M
+
+# Log retention in days (default: 3)
+LOG_RETENTION_DAYS=7
 ```
 
 ## How It Works
 
-1. Creates a marker file in `/tmp/claude-pane.$USER/` to track pane positions
-2. When opening a pane at an existing position, respawns instead of creating new
-3. Commands are wrapped with:
-   - Optional title header
-   - Exit code display
-   - "Press q to close" prompt
-4. Optionally logs output via `script(1)` for debugging
+1. Creates marker files in `/tmp/claude-pane.$USER/` to track pane positions
+2. When opening a pane at an existing position, respawns instead of creating new (no flickering)
+3. All commands are wrapped with `script(1)` for PTY preservation and logging
+4. Output is logged to `/tmp/claude-pane.$USER/logs/` with timing data
+5. Commands display:
+   - Optional title header (cyan)
+   - Navigation hints (`--page`: scroll instructions, `--follow`: Ctrl+C hint)
+   - Exit code on completion
+   - "Press q to close" prompt (non-paging modes)
+6. Stale markers and old logs (>3 days) are cleaned up automatically
 
 ## For Claude Code Users
 
-See [CLAUDE.md](CLAUDE.md) for heuristics and examples on how to teach Claude to use this tool effectively in teaching sessions.
+See these guides for heuristics on using claude-pane effectively:
+
+- [CLAUDE-development.md](CLAUDE-development.md) - Development workflows (file viewing, log streaming, diffs)
+- [CLAUDE-teaching.md](CLAUDE-teaching.md) - Teaching sessions (code examples, live demos, notebooks)
