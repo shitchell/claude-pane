@@ -373,6 +373,15 @@ function pane-exists() {
     tmux list-panes -a -F '#{pane_id}' 2>/dev/null | grep -Fxq "${__pane_id}"
 }
 
+function pane-in-current-window() {
+    :  'Check if pane ID is in the current tmux window'
+    local -- __pane_id="${1}"
+    local -- __window_id
+
+    __window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null) || return 1
+    tmux list-panes -t "${__window_id}" -F '#{pane_id}' 2>/dev/null | grep -Fxq "${__pane_id}"
+}
+
 function clean-stale-markers() {
     :  'Remove markers for panes that no longer exist'
     :  'Called at start of every invocation - simplifies logic elsewhere'
@@ -474,8 +483,10 @@ function find-pane-at-position() {
     __marker_file=$(build-marker-path "${__position}")
     __expected_title="claude-pane:${__position}"
 
-    # 1. Try marker file first (also validates pane still exists)
-    if read-marker "${__marker_file}" 2>/dev/null && pane-exists "${MARKER[pane_id]:-}"; then
+    # 1. Try marker file first (also validates pane still exists in current window)
+    if read-marker "${__marker_file}" 2>/dev/null \
+        && pane-exists "${MARKER[pane_id]:-}" \
+        && pane-in-current-window "${MARKER[pane_id]:-}"; then
         FOUND_PANE_ID="${MARKER[pane_id]}"
         FOUND_VIA="marker"
         return 0
@@ -804,7 +815,6 @@ function __action-run-build-paths() {
     __slug=$(printf '%s' "${COMMAND_RAW:-unknown}" | tr -cs '[:alnum:]' '_' | cut -c1-50)
 
     LOG_FILE="${LOG_DIR}/${__timestamp}-${__slug}.script.log"
-    LOG_TIMING_FILE="${LOG_DIR}/${__timestamp}-${__slug}.timing"
     SCRIPT_FILE="${LOG_DIR}/${__timestamp}-${__slug}.sh"
 }
 
@@ -814,14 +824,13 @@ function __action-run-build-wrapped-command() {
 
     # script options: -q (quiet), -e (return exit), -f (flush)
     # -c must be separate as it takes an argument
-    # -T (timing log), -o (size limit)
+    # -o (size limit)
     __script_opts="-qe"
     ${DO_INTERACTIVE} || __script_opts+="f"
 
     # Build command string - only quote values that need it, not options
     # -c must be followed by its argument (the command)
     COMMAND_FINAL="script ${__script_opts} -c ${COMMAND_BUILT@Q}"
-    COMMAND_FINAL+=" -T ${LOG_TIMING_FILE@Q}"
     COMMAND_FINAL+=" -o ${LOG_SIZE_LIMIT@Q}"
     COMMAND_FINAL+=" ${LOG_FILE@Q}"
 
@@ -919,8 +928,10 @@ function __action-run-create-or-update-pane() {
     __source_pane=$(get-current-pane-id) || return 1
     __marker_file=$(build-marker-path "${RUN_POSITION}")
 
-    # Check if we should respawn (marker exists AND pane still exists)
-    if read-marker "${__marker_file}" 2>/dev/null && pane-exists "${MARKER[pane_id]:-}"; then
+    # Check if we should respawn (marker exists AND pane still exists in current window)
+    if read-marker "${__marker_file}" 2>/dev/null \
+        && pane-exists "${MARKER[pane_id]:-}" \
+        && pane-in-current-window "${MARKER[pane_id]:-}"; then
         # Existing pane - respawn it
         __tmux_args=(respawn-pane -t "${MARKER[pane_id]}" -k "${SCRIPT_FILE}")
         __new_pane_id="${MARKER[pane_id]}"
