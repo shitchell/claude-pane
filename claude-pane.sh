@@ -588,6 +588,7 @@ CONTENT SOURCE (one required):
 
 OPTIONS:
   --title "..."               label shown at top of pane
+  --jump-to <pattern>         jump to first match of pattern in paged output
   --page                      pipe through less -R with mouse scrolling
   --no-page                   disable paging (default for most, except --run-in-blocks)
   --interactive               enable stdin for interactive commands
@@ -620,6 +621,7 @@ function __action-run-parse-args() {
     RUN_BLOCKS_SCRIPT=""
     RUN_VIEW_FILE=""
     RUN_TITLE=""
+    RUN_JUMP_TO=""
     DO_PAGE=false
     DO_PAGE_EXPLICIT=false
     DO_INTERACTIVE=false
@@ -636,6 +638,11 @@ function __action-run-parse-args() {
             --title)
                 [[ -n "${2:-}" ]] || { error "--title requires an argument"; return 1; }
                 RUN_TITLE="${2}"
+                shift
+                ;;
+            --jump-to)
+                [[ -n "${2:-}" ]] || { error "--jump-to requires a pattern"; return 1; }
+                RUN_JUMP_TO="${2}"
                 shift
                 ;;
             --command)
@@ -797,11 +804,14 @@ function __action-run-build-command() {
         COMMAND_BUILT="block-run ${RUN_BLOCKS_SCRIPT@Q}"
     elif [[ -n "${RUN_VIEW_FILE}" ]]; then
         COMMAND_RAW="${RUN_VIEW_FILE}"
+        # Build less options (add jump pattern if specified)
+        local -- __less_opts="-R"
+        [[ -n "${RUN_JUMP_TO}" ]] && __less_opts+=" '+/${RUN_JUMP_TO}'"
         # Use lessfilter if available for syntax highlighting, otherwise plain less
         if command -v lessfilter &>/dev/null; then
-            COMMAND_BUILT="lessfilter ${RUN_VIEW_FILE@Q} | less -R"
+            COMMAND_BUILT="lessfilter ${RUN_VIEW_FILE@Q} | less ${__less_opts}"
         else
-            COMMAND_BUILT="less ${RUN_VIEW_FILE@Q}"
+            COMMAND_BUILT="less ${__less_opts} ${RUN_VIEW_FILE@Q}"
         fi
     fi
 }
@@ -843,7 +853,11 @@ function __action-run-build-post-process-string() {
     :  'Returns " | less -R" or "" etc.'
 
     if ${DO_PAGE}; then
-        echo " | less -R"
+        if [[ -n "${RUN_JUMP_TO}" ]]; then
+            echo " | less -R '+/${RUN_JUMP_TO}'"
+        else
+            echo " | less -R"
+        fi
     else
         echo ""
     fi
