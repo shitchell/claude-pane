@@ -1059,8 +1059,23 @@ function __action-kill-parse-args() {
     return ${E_SUCCESS}
 }
 
+function kill-process-tree() {
+    :  'Recursively kill all descendants of a process
+
+        Kills children depth-first, then the parent.
+    '
+    local -- __pid="${1}"
+    local -- __child
+
+    for __child in $(pgrep -P "${__pid}" 2>/dev/null); do
+        kill-process-tree "${__child}"
+    done
+    kill -TERM "${__pid}" 2>/dev/null
+}
+
 function __action-kill() {
     :  'Close pane at position'
+    local -- __pane_pid
 
     if ! find-pane-at-position "${KILL_POSITION}"; then
         echo "no pane at position '${KILL_POSITION}'"
@@ -1071,6 +1086,12 @@ function __action-kill() {
     if [[ "${FOUND_VIA}" == "title" ]]; then
         echo "warning: marker file missing, but found pane ${FOUND_PANE_ID} by title 'claude-pane:${KILL_POSITION}'" >&2
     fi
+
+    # Kill the process tree before killing the pane
+    # This is necessary because 'script' creates its own PTY, so its children
+    # would otherwise survive as orphans when tmux kills the pane's shell
+    __pane_pid=$(tmux display-message -t "${FOUND_PANE_ID}" -p '#{pane_pid}' 2>/dev/null)
+    [[ -n "${__pane_pid}" ]] && kill-process-tree "${__pane_pid}"
 
     # Kill the pane
     tmux kill-pane -t "${FOUND_PANE_ID}" || { error "failed to kill pane"; return 1; }
