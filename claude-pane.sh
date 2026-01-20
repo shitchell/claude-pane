@@ -374,11 +374,12 @@ function pane-exists() {
 }
 
 function pane-in-current-window() {
-    :  'Check if pane ID is in the current tmux window'
+    :  'Check if pane ID is in the invoking shell tmux window'
     local -- __pane_id="${1}"
     local -- __window_id
 
-    __window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null) || return 1
+    # Use -t to get the window containing our shell, not the focused window
+    __window_id=$(tmux display-message -t "${TMUX_PANE}" -p '#{window_id}' 2>/dev/null) || return 1
     tmux list-panes -t "${__window_id}" -F '#{pane_id}' 2>/dev/null | grep -Fxq "${__pane_id}"
 }
 
@@ -495,8 +496,8 @@ function find-pane-at-position() {
     # Marker exists but pane doesn't - stale, remove it
     [[ -f "${__marker_file}" ]] && rm -f "${__marker_file}"
 
-    # 2. Fallback: search current window for pane with expected title
-    __window_id=$(tmux display-message -p '#{window_id}' 2>/dev/null) || return 1
+    # 2. Fallback: search invoking shell's window for pane with expected title
+    __window_id=$(tmux display-message -t "${TMUX_PANE}" -p '#{window_id}' 2>/dev/null) || return 1
 
     # List panes in current window with their titles
     __pane_info=$(tmux list-panes -t "${__window_id}" -F '#{pane_id}	#{pane_title}' 2>/dev/null \
