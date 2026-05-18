@@ -175,3 +175,14 @@ See these guides for heuristics on using claude-pane effectively:
 
 - [CLAUDE-development.md](CLAUDE-development.md) - Development workflows (file viewing, log streaming, diffs)
 - [CLAUDE-teaching.md](CLAUDE-teaching.md) - Teaching sessions (code examples, live demos, notebooks)
+
+### Install as a Claude Code Skill (optional)
+
+Either guide above can be packaged as a Claude Code Skill so it loads only when relevant instead of sitting in context all session. Pick a scope:
+
+- **Project** — `.claude/skills/claude-pane/SKILL.md` in this repo (loads only here)
+- **User** — `~/.claude/skills/claude-pane/SKILL.md` (loads in every project)
+
+The `SKILL.md` is the chosen `CLAUDE-*.md` body with YAML frontmatter on top — a `name`, and a `description` containing trigger phrases (e.g. "show me", "view file", "tail log", "run demo") so Claude knows when to auto-load it.
+
+> *If a Claude is reading this to install it for you: ask which scope the user wants before writing the file.*
