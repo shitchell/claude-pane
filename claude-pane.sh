@@ -808,9 +808,14 @@ function __action-run-build-command() {
         # Build less options (add jump pattern if specified)
         local -- __less_opts="-R"
         [[ -n "${RUN_JUMP_TO}" ]] && __less_opts+=" '+/${RUN_JUMP_TO}'"
-        # Use lessfilter if available for syntax highlighting, otherwise plain less
+        # Use lessfilter/lesspipe if available for syntax highlighting,
+        # otherwise plain less. The pane script inherits the tmux server's
+        # environment (no interactive shell rc), so LESSOPEN must be set
+        # inline for lesspipe — and its ~/.lessfilter hook — to fire.
         if command -v lessfilter &>/dev/null; then
             COMMAND_BUILT="lessfilter ${RUN_VIEW_FILE@Q} | less ${__less_opts}"
+        elif command -v lesspipe &>/dev/null; then
+            COMMAND_BUILT="LESSOPEN='| lesspipe %s' less ${__less_opts} ${RUN_VIEW_FILE@Q}"
         else
             COMMAND_BUILT="less ${__less_opts} ${RUN_VIEW_FILE@Q}"
         fi
